@@ -69,8 +69,12 @@ object Probes {
         add("tcp1", "TCP 1.1.1.1:443 (no DNS)") { tcp("1.1.1.1", null) }
         add("tcp8", "TCP 8.8.8.8:443 (no DNS)") { tcp("8.8.8.8", null) }
         add("tcp6", "TCP [2606:4700:4700::1111]:443 (IPv6)") {
-            val r = tcp("2606:4700:4700::1111", null)
-            if (r.first == Status.FAIL) Status.WARN to r.second else r
+            // Many networks have no IPv6, so this is a warning rather than a failure.
+            try {
+                tcp("2606:4700:4700::1111", null)
+            } catch (e: Exception) {
+                Status.WARN to "${e.javaClass.simpleName}: ${e.message}"
+            }
         }
         add("tls", "TLS certificate chain ($TEST_HOST)") { tlsChain(TEST_HOST) }
 
@@ -81,11 +85,43 @@ object Probes {
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@forEach
             if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@forEach
             val lbl = Net.label(n, NetworkWatcher.networks.value[n]?.caps ?: caps)
-            add("net:http204:$n", "[$lbl] connectivity check, bypassing VPN") { http204(HTTP_204, n) }
-            add("net:dns:$n", "[$lbl] DNS via this network, bypassing VPN") { sysDns(n) }
+            add("net:http204:$n", "[$lbl] connectivity check, bypassing VPN") { bypass { http204(HTTP_204, n) } }
+            add("net:dns:$n", "[$lbl] DNS via this network, bypassing VPN") { bypass { sysDns(n) } }
         }
 
         jobs.awaitAll()
+    }
+
+    /** EPERM when binding to another network just means the VPN doesn't allow apps to bypass it. */
+    private fun bypass(block: () -> Pair<Status, String>): Pair<Status, String> = try {
+        block()
+    } catch (e: Exception) {
+        if (e.message?.contains("EPERM") == true) {
+            Status.WARN to "Not allowed: the VPN doesn't let apps bypass it (expected with AdGuard on)"
+        } else {
+            throw e
+        }
+    }
+
+    /**
+     * Tries every resolved address in order, like real apps do, instead of only the first.
+     * Returns the connected socket plus a note about any addresses that failed first.
+     */
+    private fun connectAny(host: String): Pair<Socket, String?> {
+        val failures = mutableListOf<String>()
+        for (addr in InetAddress.getAllByName(host)) {
+            val s = Socket()
+            try {
+                s.connect(InetSocketAddress(addr, 443), TIMEOUT_MS)
+                val note = if (failures.isEmpty()) null
+                else "first tried ${failures.joinToString()}; connected via ${addr.hostAddress}"
+                return s to note
+            } catch (e: Exception) {
+                runCatching { s.close() }
+                failures += "${addr.hostAddress} (${e.message?.substringAfterLast(": ")})"
+            }
+        }
+        throw java.io.IOException("all addresses failed: ${failures.joinToString()}")
     }
 
     private fun timed(key: String, name: String, block: () -> Pair<Status, String>): ProbeResult {
@@ -243,9 +279,8 @@ object Probes {
         }
         val ssl = SSLContext.getInstance("TLS").apply { init(null, arrayOf(capture), null) }
         var error: String? = null
-        val raw = Socket()
+        val (raw, note) = connectAny(host)
         try {
-            raw.connect(InetSocketAddress(host, 443), TIMEOUT_MS)
             raw.soTimeout = TIMEOUT_MS
             (ssl.socketFactory.createSocket(raw, host, 443, true) as SSLSocket).use { it.startHandshake() }
         } catch (e: Exception) {
@@ -258,7 +293,8 @@ object Probes {
         fun cn(p: String) = Regex("CN=([^,]+)").find(p)?.groupValues?.get(1) ?: p
         val leafIssuer = cn(c[0].issuerX500Principal.name)
         val root = cn(c.last().issuerX500Principal.name)
-        val desc = "leaf issued by \"$leafIssuer\", top issuer \"$root\", ${c.size} certs"
+        val desc = "leaf issued by \"$leafIssuer\", top issuer \"$root\", ${c.size} certs" +
+            (note?.let { " ($it)" } ?: "")
         val allIssuers = c.joinToString { it.issuerX500Principal.name }
         return when {
             allIssuers.contains("AdGuard", ignoreCase = true) -> Status.WARN to "AdGuard is intercepting HTTPS for this app: $desc" + (error?.let { "; $it" } ?: "")
@@ -294,12 +330,12 @@ object Analysis {
         }
 
         val directOk = results.any { it.key.startsWith("net:http204") && it.status == Status.OK }
-        val directAllFailed = results.filter { it.key.startsWith("net:http204") }.let { it.isNotEmpty() && it.all { r -> r.status == Status.FAIL } }
         if (failed("http204") && directOk) {
             h += "Android's connectivity check FAILS through the VPN but WORKS when sent directly over the network underneath. AdGuard is blocking or changing it. Try allowlisting connectivitycheck.gstatic.com and www.google.com/generate_204 in AdGuard."
         }
-        if (def?.isVpn == true && directAllFailed && ok("http204")) {
-            h += "The bypass-VPN probes fail, probably because AdGuard doesn't let apps bypass its VPN. That's expected. To compare, exclude this app in AdGuard and run again."
+        val vpnHasV6 = def?.isVpn == true && def.lp?.linkAddresses?.any { it.address is java.net.Inet6Address && !it.address.isLinkLocalAddress } == true
+        if (vpnHasV6 && st("tcp6") == Status.WARN && (ok("tcp1") || ok("tcp8"))) {
+            h += "AdGuard's VPN gives this phone an IPv6 address, but IPv6 traffic through it is unreachable while IPv4 works. Apps that try IPv6 first and fall back badly may think they're offline. Try turning off IPv6 filtering in AdGuard's network settings."
         }
         if (failed("sysdns") && (ok("tcp1") || ok("tcp8"))) {
             h += "DNS lookups fail but connecting by IP address works, so this is a DNS problem. AdGuard's upstream DNS server may be unreachable, for example encrypted DNS blocked by this Wi-Fi or captive portal."
