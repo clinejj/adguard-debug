@@ -60,12 +60,15 @@ object Probes {
         add("https204", "HTTPS generate_204") { http204(HTTPS_204, null) }
         add("cftrace", "Cloudflare trace (HTTPS)") { cfTrace() }
         add("sysdns", "DNS: system resolver ($TEST_HOST)") { sysDns(null) }
-        add("udp8", "DNS: UDP to 8.8.8.8") { udpDns(InetAddress.getByName("8.8.8.8"), null) }
-        add("udp1", "DNS: UDP to 1.1.1.1") { udpDns(InetAddress.getByName("1.1.1.1"), null) }
+        // With AdGuard's DNS filtering on, any port-53 query is intercepted and answered by AdGuard,
+        // so these test AdGuard's DNS proxy rather than the network.
+        add("udp8", "DNS: UDP to 8.8.8.8 (answered by AdGuard if it intercepts DNS)") { udpDns(InetAddress.getByName("8.8.8.8"), null) }
+        add("udp1", "DNS: UDP to 1.1.1.1 (answered by AdGuard if it intercepts DNS)") { udpDns(InetAddress.getByName("1.1.1.1"), null) }
         cm.activeNetwork?.let { cm.getLinkProperties(it) }?.dnsServers?.take(2)?.forEach { s ->
             add("lpdns:${s.hostAddress}", "DNS: UDP to default-net server ${s.hostAddress}") { udpDns(s, null) }
         }
         add("doh", "DNS over HTTPS (https://1.1.1.1, no system DNS)") { doh() }
+        add("dohag", "AdGuard DNS over HTTPS (94.140.14.14, no system DNS)") { dohWire("94.140.14.14", "dns.adguard-dns.com") }
         add("tcp1", "TCP 1.1.1.1:443 (no DNS)") { tcp("1.1.1.1", null) }
         add("tcp8", "TCP 8.8.8.8:443 (no DNS)") { tcp("8.8.8.8", null) }
         add("tcp6", "TCP [2606:4700:4700::1111]:443 (IPv6)") {
@@ -86,7 +89,8 @@ object Probes {
             if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) return@forEach
             val lbl = Net.label(n, NetworkWatcher.networks.value[n]?.caps ?: caps)
             add("net:http204:$n", "[$lbl] connectivity check, bypassing VPN") { bypass { http204(HTTP_204, n) } }
-            add("net:dns:$n", "[$lbl] DNS via this network, bypassing VPN") { bypass { sysDns(n) } }
+            // Android sends this lookup through the VPN anyway when the VPN can't be bypassed.
+            add("net:dns:$n", "[$lbl] DNS lookup on this network (goes via VPN if bypass blocked)") { bypass { sysDns(n) } }
         }
 
         jobs.awaitAll()
@@ -208,16 +212,56 @@ object Probes {
         }
     }
 
-    /** Raw DNS A query over UDP; bypasses Android's resolver (but not the VPN). */
-    private fun udpDns(server: InetAddress, net: Network?): Pair<Status, String> {
-        val id = Random.nextInt(0x10000)
+    private fun dnsQuery(id: Int): ByteArray {
         val bos = ByteArrayOutputStream()
         DataOutputStream(bos).apply {
             writeShort(id); writeShort(0x0100); writeShort(1); writeShort(0); writeShort(0); writeShort(0)
             TEST_HOST.split('.').forEach { writeByte(it.length); write(it.toByteArray()) }
             writeByte(0); writeShort(1); writeShort(1)
         }
-        val q = bos.toByteArray()
+        return bos.toByteArray()
+    }
+
+    /**
+     * RFC 8484 DoH query sent straight to [ip] with [sni] as the TLS server name, so it needs no
+     * DNS lookup first: shows whether the upstream itself is reachable from this network.
+     */
+    private fun dohWire(ip: String, sni: String): Pair<Status, String> {
+        val q = android.util.Base64.encodeToString(
+            dnsQuery(0), android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
+        )
+        val raw = Socket()
+        try {
+            raw.connect(InetSocketAddress(InetAddress.getByName(ip), 443), TIMEOUT_MS)
+            raw.soTimeout = TIMEOUT_MS
+            val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+            (factory.createSocket(raw, sni, 443, true) as SSLSocket).use { s ->
+                s.startHandshake()
+                if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier().verify(sni, s.session)) {
+                    return Status.FAIL to "certificate doesn't match $sni"
+                }
+                s.outputStream.apply {
+                    write("GET /dns-query?dns=$q HTTP/1.0\r\nHost: $sni\r\nAccept: application/dns-message\r\nConnection: close\r\n\r\n".toByteArray())
+                    flush()
+                }
+                val resp = s.inputStream.readBytes()
+                val headerEnd = (0 until resp.size - 3).firstOrNull {
+                    resp[it] == '\r'.code.toByte() && resp[it + 1] == '\n'.code.toByte() &&
+                        resp[it + 2] == '\r'.code.toByte() && resp[it + 3] == '\n'.code.toByte()
+                } ?: return Status.FAIL to "malformed HTTP response"
+                val status = String(resp, 0, headerEnd).lineSequence().first()
+                if (!status.contains(" 200")) return Status.FAIL to status
+                val body = resp.copyOfRange(headerEnd + 4, resp.size)
+                return parseDns(body, body.size)
+            }
+        } finally {
+            runCatching { raw.close() }
+        }
+    }
+
+    /** Raw DNS A query over UDP; bypasses Android's resolver (but not the VPN). */
+    private fun udpDns(server: InetAddress, net: Network?): Pair<Status, String> {
+        val q = dnsQuery(Random.nextInt(0x10000))
         DatagramSocket().use { s ->
             net?.bindSocket(s)
             s.soTimeout = 3000
@@ -338,7 +382,13 @@ object Analysis {
             h += "AdGuard's VPN gives this phone an IPv6 address, but IPv6 traffic through it is unreachable while IPv4 works. Apps that try IPv6 first and fall back badly may think they're offline. Try turning off IPv6 filtering in AdGuard's network settings."
         }
         if (failed("sysdns") && (ok("tcp1") || ok("tcp8"))) {
-            h += "DNS lookups fail but connecting by IP address works, so this is a DNS problem. AdGuard's upstream DNS server may be unreachable, for example encrypted DNS blocked by this Wi-Fi or captive portal."
+            h += when {
+                def?.isVpn == true && ok("dohag") ->
+                    "DNS lookups fail, but AdGuard DNS answers when contacted directly by IP. So the network is fine and AdGuard's own DNS proxy is stuck. Turning AdGuard protection off and on should fix it. With 'Use fallback for all domains' on, AdGuard falls back to the network's DNS instead."
+                def?.isVpn == true ->
+                    "DNS lookups fail and AdGuard DNS can't be reached directly either, but connecting by IP works. AdGuard's DNS upstream is unreachable from this network."
+                else -> "DNS lookups fail but connecting by IP address works, so this network's DNS is broken."
+            }
         }
         val udpOk = ok("udp8") || ok("udp1")
         if (failed("doh") && udpOk) {
